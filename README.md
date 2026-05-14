@@ -1,6 +1,16 @@
 # Multi-Stocks AI Trading Dashboard
 
-Streamlit dashboard with multi-stock monitoring, AI-style next-close bias, VWAP and RSI signals, Bloomberg-style heatmap, smart-money volume detection, Telegram alerts, WhatsApp Cloud API alerts, and responsive layout.
+Streamlit dashboard with multi-stock monitoring, AI-style next-close bias, VWAP and RSI signals, Bloomberg-style heatmap, smart-money volume detection, Telegram alerts, WhatsApp Cloud API alerts, responsive layout, paper-trading bot controls, backtesting, portfolio rebalancing, and options-chain analysis.
+
+## Options Features
+
+- Full calls/puts chain analyzer from Yahoo Finance data
+- Best strike auto picker
+- Delta, Gamma, and Theta dashboard
+- Probability of profit estimate
+- Paper-only options bot ticket with suggested action, limit price, take profit, and stop loss
+
+Live stock or options order execution is intentionally not enabled by default. Connect a broker API only after reviewing order permissions, risk controls, and local regulations.
 
 ## Run
 
