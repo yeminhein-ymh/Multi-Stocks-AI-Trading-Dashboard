@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from datetime import datetime, timezone
 from urllib.parse import urlencode
@@ -317,6 +318,161 @@ def rebalance_plan(summary: pd.DataFrame, portfolio_value: float, max_weight_pct
     return data[["Symbol", "Signal", "ML Prob %", "Target Weight %", "Target Value", "Approx Shares"]]
 
 
+def norm_cdf(value: float) -> float:
+    return 0.5 * (1 + math.erf(value / math.sqrt(2)))
+
+
+def norm_pdf(value: float) -> float:
+    return math.exp(-0.5 * value * value) / math.sqrt(2 * math.pi)
+
+
+def black_scholes_greeks(option_type: str, spot: float, strike: float, years: float, rate: float, iv: float) -> dict:
+    years = max(years, 1 / 365)
+    iv = max(iv, 0.01)
+    if spot <= 0 or strike <= 0:
+        return {"Delta": 0.0, "Gamma": 0.0, "Theta": 0.0}
+
+    d1 = (math.log(spot / strike) + (rate + 0.5 * iv * iv) * years) / (iv * math.sqrt(years))
+    d2 = d1 - iv * math.sqrt(years)
+    gamma = norm_pdf(d1) / (spot * iv * math.sqrt(years))
+
+    if option_type == "call":
+        delta = norm_cdf(d1)
+        theta = (-(spot * norm_pdf(d1) * iv) / (2 * math.sqrt(years)) - rate * strike * math.exp(-rate * years) * norm_cdf(d2)) / 365
+    else:
+        delta = norm_cdf(d1) - 1
+        theta = (-(spot * norm_pdf(d1) * iv) / (2 * math.sqrt(years)) + rate * strike * math.exp(-rate * years) * norm_cdf(-d2)) / 365
+
+    return {"Delta": delta, "Gamma": gamma, "Theta": theta}
+
+
+def probability_of_profit(option_type: str, spot: float, strike: float, premium: float, years: float, rate: float, iv: float) -> float:
+    years = max(years, 1 / 365)
+    iv = max(iv, 0.01)
+    premium = max(premium, 0.01)
+    if option_type == "call":
+        breakeven = strike + premium
+        z = (math.log(breakeven / spot) - (rate - 0.5 * iv * iv) * years) / (iv * math.sqrt(years))
+        return (1 - norm_cdf(z)) * 100
+    breakeven = max(strike - premium, 0.01)
+    z = (math.log(breakeven / spot) - (rate - 0.5 * iv * iv) * years) / (iv * math.sqrt(years))
+    return norm_cdf(z) * 100
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_option_expirations(symbol: str) -> list[str]:
+    try:
+        return list(yf.Ticker(symbol).options)
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_option_chain(symbol: str, expiration: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    try:
+        chain = yf.Ticker(symbol).option_chain(expiration)
+        return chain.calls.copy(), chain.puts.copy()
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
+
+def analyze_option_chain(
+    calls: pd.DataFrame,
+    puts: pd.DataFrame,
+    spot: float,
+    expiration: str,
+    risk_free_rate: float,
+    max_spread_pct: float,
+    min_volume: int,
+    target_delta: float,
+    direction: str,
+) -> pd.DataFrame:
+    expiry_dt = pd.to_datetime(expiration).to_pydatetime().replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    years = max((expiry_dt - now).days / 365, 1 / 365)
+    frames = []
+    for option_type, chain in [("call", calls), ("put", puts)]:
+        if chain.empty:
+            continue
+        data = chain.copy()
+        data["Type"] = option_type.upper()
+        data["Mid"] = np.where((data["bid"] > 0) & (data["ask"] > 0), (data["bid"] + data["ask"]) / 2, data["lastPrice"])
+        data["Spread %"] = np.where(data["Mid"] > 0, ((data["ask"] - data["bid"]) / data["Mid"]) * 100, 999)
+        data["IV %"] = data["impliedVolatility"].fillna(0.01).clip(lower=0.01) * 100
+        data["Volume"] = data["volume"].fillna(0)
+        data["Open Interest"] = data["openInterest"].fillna(0)
+        greek_rows = []
+        pops = []
+        for row in data.itertuples():
+            iv = max(float(row.impliedVolatility or 0.01), 0.01)
+            premium = float(row.Mid or row.lastPrice or 0.01)
+            strike = float(row.strike)
+            greek_rows.append(black_scholes_greeks(option_type, spot, strike, years, risk_free_rate, iv))
+            pops.append(probability_of_profit(option_type, spot, strike, premium, years, risk_free_rate, iv))
+        greeks = pd.DataFrame(greek_rows, index=data.index)
+        data = pd.concat([data, greeks], axis=1)
+        data["POP %"] = pops
+        data["Breakeven"] = np.where(data["Type"].eq("CALL"), data["strike"] + data["Mid"], data["strike"] - data["Mid"])
+        data["Moneyness %"] = ((data["strike"] / spot) - 1) * 100
+        frames.append(data)
+
+    if not frames:
+        return pd.DataFrame()
+
+    options = pd.concat(frames, ignore_index=True)
+    options = options[(options["Mid"] > 0) & (options["Spread %"] <= max_spread_pct) & (options["Volume"] >= min_volume)].copy()
+    if options.empty:
+        return options
+
+    if direction == "Bullish":
+        options = options[options["Type"].eq("CALL")].copy()
+    elif direction == "Bearish":
+        options = options[options["Type"].eq("PUT")].copy()
+
+    if options.empty:
+        return options
+
+    liquidity_score = np.log1p(options["Volume"] + options["Open Interest"]) / np.log1p((options["Volume"] + options["Open Interest"]).max())
+    spread_score = (1 - (options["Spread %"] / max_spread_pct)).clip(0, 1)
+    delta_score = (1 - (options["Delta"].abs() - target_delta).abs() / max(target_delta, 0.01)).clip(0, 1)
+    pop_score = (options["POP %"] / 100).clip(0, 1)
+    options["Picker Score"] = (0.34 * pop_score + 0.28 * liquidity_score + 0.23 * delta_score + 0.15 * spread_score) * 100
+    options["Bot Action"] = np.where(options["Picker Score"] >= 68, "PAPER BUY", np.where(options["Picker Score"] <= 35, "AVOID", "WATCH"))
+    return options.sort_values("Picker Score", ascending=False)
+
+
+def make_options_scatter(options: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if options.empty:
+        return fig
+    for option_type, color in [("CALL", "#16a34a"), ("PUT", "#b91c1c")]:
+        subset = options[options["Type"].eq(option_type)]
+        if subset.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=subset["strike"],
+                y=subset["POP %"],
+                mode="markers",
+                name=option_type,
+                marker=dict(size=np.clip(subset["Open Interest"] / max(subset["Open Interest"].max(), 1) * 22 + 7, 7, 28), color=color, opacity=0.72),
+                text=subset["contractSymbol"],
+                hovertemplate="%{text}<br>Strike %{x}<br>POP %{y:.1f}%<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        height=330,
+        margin=dict(l=10, r=10, t=25, b=10),
+        template="plotly_white",
+        paper_bgcolor="#f6f7fb",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#334155"),
+        xaxis_title="Strike",
+        yaxis_title="Probability of Profit %",
+    )
+    return fig
+
+
 def alert_message(rows: pd.DataFrame) -> str:
     actionable = rows[rows["Signal"].isin(["BUY", "SELL", "SMART MONEY"])]
     if actionable.empty:
@@ -465,6 +621,15 @@ with st.sidebar:
     period = st.selectbox("History", PERIOD_OPTIONS, index=2)
     interval = st.selectbox("Interval", INTERVAL_OPTIONS, index=3)
     selected_symbol = st.text_input("Chart symbol", value=DEFAULT_SYMBOLS[0])
+    option_symbol = selected_symbol.strip().upper() or DEFAULT_SYMBOLS[0]
+    option_expirations = fetch_option_expirations(option_symbol)
+    st.header("Options analyzer")
+    option_direction = st.selectbox("Options direction", ["Auto", "Bullish", "Bearish", "Both"], index=0)
+    option_expiration = st.selectbox("Expiration", option_expirations, index=0) if option_expirations else ""
+    target_delta = st.slider("Target option Delta", min_value=0.10, max_value=0.80, value=0.35, step=0.05)
+    max_spread_pct = st.slider("Max option spread %", min_value=5, max_value=100, value=35, step=5)
+    min_option_volume = st.number_input("Min option volume", min_value=0, max_value=10000, value=0, step=10)
+    risk_free_rate = st.slider("Risk-free rate %", min_value=0.0, max_value=10.0, value=4.5, step=0.1) / 100
     st.header("Bot controls")
     bot_threshold = st.slider("Entry confidence", min_value=0.50, max_value=0.90, value=0.58, step=0.01)
     starting_cash = st.number_input("Backtest cash", min_value=1000, max_value=1000000, value=10000, step=1000)
@@ -501,7 +666,7 @@ metric_cols[1].metric("Best AI Move", leader["Symbol"], f"{leader['AI Move %']:.
 metric_cols[2].metric("Smart Money", int((summary["Smart Money"] == "Yes").sum()))
 metric_cols[3].metric("Auto Entries", int((summary["Bot Action"] == "AUTO ENTRY").sum()))
 
-tab_market, tab_bot, tab_backtest, tab_portfolio = st.tabs(["Market", "Auto Bot", "Backtest", "Portfolio AI"])
+tab_market, tab_bot, tab_options, tab_backtest, tab_portfolio = st.tabs(["Market", "Auto Bot", "Options Bot", "Backtest", "Portfolio AI"])
 
 with tab_market:
     st.subheader("Bloomberg-Style Heatmap")
@@ -558,6 +723,101 @@ with tab_bot:
 
 chart_symbol = selected_symbol.strip().upper() or summary.iloc[0]["Symbol"]
 history = fetch_history(chart_symbol, period, interval)
+with tab_options:
+    st.subheader("Full Options Chain Analyzer")
+    st.caption("Options bot is paper-trade only here. Live execution needs a broker API connection and explicit order approval.")
+    summary_match = summary[summary["Symbol"].eq(chart_symbol)]
+    if summary_match.empty:
+        st.warning(f"No stock signal data found for {chart_symbol}.")
+    elif not option_expiration:
+        st.warning(f"No listed option expirations found for {chart_symbol}. Try another symbol such as AAPL, MSFT, NVDA, or TSLA.")
+    else:
+        spot_price = float(summary_match.iloc[0]["Price"])
+        stock_signal = str(summary_match.iloc[0]["Signal"])
+        auto_direction = "Bearish" if stock_signal == "SELL" or float(summary_match.iloc[0]["AI Move %"]) < -0.25 else "Bullish"
+        resolved_direction = auto_direction if option_direction == "Auto" else option_direction
+        with st.spinner(f"Loading {chart_symbol} options chain..."):
+            calls, puts = fetch_option_chain(chart_symbol, option_expiration)
+            options = analyze_option_chain(
+                calls,
+                puts,
+                spot_price,
+                option_expiration,
+                float(risk_free_rate),
+                float(max_spread_pct),
+                int(min_option_volume),
+                float(target_delta),
+                resolved_direction,
+            )
+        if options.empty:
+            st.warning("No option contracts matched your filters. Try a wider spread limit, lower minimum volume, or another expiration.")
+        else:
+            best = options.iloc[0]
+            opt_cols = st.columns(4)
+            opt_cols[0].metric("Underlying", chart_symbol, f"{spot_price:.2f}")
+            opt_cols[1].metric("Direction", resolved_direction)
+            opt_cols[2].metric("Best Strike", f"{best['Type']} {best['strike']:.2f}")
+            opt_cols[3].metric("POP", f"{best['POP %']:.1f}%", f"Score {best['Picker Score']:.1f}")
+
+            st.plotly_chart(make_options_scatter(options), width="stretch")
+
+            st.subheader("Best Strike Auto Picker")
+            st.dataframe(
+                options[
+                    [
+                        "contractSymbol",
+                        "Type",
+                        "strike",
+                        "lastPrice",
+                        "bid",
+                        "ask",
+                        "Mid",
+                        "Spread %",
+                        "impliedVolatility",
+                        "IV %",
+                        "Volume",
+                        "Open Interest",
+                        "Delta",
+                        "Gamma",
+                        "Theta",
+                        "POP %",
+                        "Breakeven",
+                        "Picker Score",
+                        "Bot Action",
+                    ]
+                ].head(25),
+                width="stretch",
+                hide_index=True,
+            )
+
+            st.subheader("Greeks Dashboard")
+            greek_cols = st.columns(3)
+            greek_cols[0].metric("Delta", f"{best['Delta']:.3f}")
+            greek_cols[1].metric("Gamma", f"{best['Gamma']:.4f}")
+            greek_cols[2].metric("Theta / day", f"{best['Theta']:.3f}")
+
+            st.subheader("Auto Options Bot")
+            if best["Bot Action"] == "PAPER BUY":
+                st.success("Paper options bot selected a candidate contract.")
+            else:
+                st.info("No high-score paper buy candidate at the current filters.")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Mode": "PAPER ONLY",
+                            "Action": "BUY TO OPEN" if best["Bot Action"] == "PAPER BUY" else "WAIT",
+                            "Contract": best["contractSymbol"],
+                            "Limit Price": round(float(best["Mid"]), 2),
+                            "Take Profit": f"{take_profit_pct:.1f}%",
+                            "Stop Loss": f"{stop_loss_pct:.1f}%",
+                            "Reason": f"{resolved_direction} setup, POP {best['POP %']:.1f}%, Delta {best['Delta']:.2f}, spread {best['Spread %']:.1f}%",
+                        }
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
 if history.empty:
     st.warning(f"No chart data found for {chart_symbol}.")
 else:
