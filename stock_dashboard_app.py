@@ -27,15 +27,20 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    [data-testid="stAppViewContainer"] { background: #f6f7fb; }
+    [data-testid="stSidebar"] { background: #eef2f7; }
     .main .block-container { padding-top: 1.1rem; padding-bottom: 2rem; }
     [data-testid="stMetric"] {
-        background: #111827;
-        border: 1px solid #243044;
+        background: #ffffff;
+        border: 1px solid #d8dee9;
         border-radius: 8px;
         padding: 12px 14px;
-        color: white;
+        color: #1f2937;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
     }
-    [data-testid="stMetric"] label { color: #cbd5e1 !important; }
+    [data-testid="stMetric"] label { color: #64748b !important; }
+    [data-testid="stMetricValue"] { color: #1f2937 !important; }
+    [data-testid="stMetricDelta"] { background: #ecfdf5; border-radius: 999px; padding: 2px 8px; }
     div[data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
     .signal-buy { color: #10b981; font-weight: 700; }
     .signal-sell { color: #ef4444; font-weight: 700; }
@@ -242,25 +247,38 @@ def make_price_chart(symbol: str, data: pd.DataFrame) -> go.Figure:
             low=data["Low"],
             close=data["Close"],
             name="Price",
+            increasing_line_color="#15803d",
+            decreasing_line_color="#b91c1c",
         )
     )
-    fig.add_trace(go.Scatter(x=data.index, y=data["VWAP"], mode="lines", name="VWAP", line=dict(color="#f59e0b", width=2)))
+    fig.add_trace(go.Scatter(x=data.index, y=data["VWAP"], mode="lines", name="VWAP", line=dict(color="#2563eb", width=2)))
     fig.update_layout(
         title=f"{symbol} price action",
         height=460,
         margin=dict(l=10, r=10, t=45, b=10),
         xaxis_rangeslider_visible=False,
-        template="plotly_dark",
+        template="plotly_white",
+        paper_bgcolor="#f6f7fb",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#334155"),
     )
     return fig
 
 
 def make_rsi_chart(data: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=data.index, y=data["RSI"], mode="lines", name="RSI", line=dict(color="#22c55e")))
-    fig.add_hrect(y0=70, y1=100, fillcolor="#ef4444", opacity=0.14, line_width=0)
-    fig.add_hrect(y0=0, y1=30, fillcolor="#10b981", opacity=0.14, line_width=0)
-    fig.update_layout(height=220, margin=dict(l=10, r=10, t=25, b=10), template="plotly_dark", yaxis_range=[0, 100])
+    fig.add_trace(go.Scatter(x=data.index, y=data["RSI"], mode="lines", name="RSI", line=dict(color="#2563eb")))
+    fig.add_hrect(y0=70, y1=100, fillcolor="#fee2e2", opacity=0.9, line_width=0)
+    fig.add_hrect(y0=0, y1=30, fillcolor="#dcfce7", opacity=0.9, line_width=0)
+    fig.update_layout(
+        height=220,
+        margin=dict(l=10, r=10, t=25, b=10),
+        template="plotly_white",
+        yaxis_range=[0, 100],
+        paper_bgcolor="#f6f7fb",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#334155"),
+    )
     return fig
 
 
@@ -271,14 +289,21 @@ def make_heatmap(summary: pd.DataFrame) -> go.Figure:
             z=heat.values,
             x=heat.columns,
             y=heat.index,
-            colorscale=[[0, "#991b1b"], [0.5, "#111827"], [1, "#16a34a"]],
+            colorscale=[[0, "#b91c1c"], [0.5, "#f1f5f9"], [1, "#16a34a"]],
             zmid=0,
             text=np.round(heat.values, 2),
             texttemplate="%{text}%",
             hovertemplate="%{x}<br>%{y}<br>%{z:.2f}%<extra></extra>",
         )
     )
-    fig.update_layout(height=310, margin=dict(l=10, r=10, t=25, b=10), template="plotly_dark")
+    fig.update_layout(
+        height=310,
+        margin=dict(l=10, r=10, t=25, b=10),
+        template="plotly_white",
+        paper_bgcolor="#f6f7fb",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#475569"),
+    )
     return fig
 
 
