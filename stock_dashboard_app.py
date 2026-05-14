@@ -100,7 +100,57 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     data["Volume_MA"] = data["Volume"].rolling(20, min_periods=5).mean()
     data["Return"] = data["Close"].pct_change()
     data["Volatility"] = data["Return"].rolling(20, min_periods=5).std() * np.sqrt(252)
+    data["SMA_10"] = data["Close"].rolling(10, min_periods=5).mean()
+    data["SMA_20"] = data["Close"].rolling(20, min_periods=10).mean()
+    data["Momentum_5"] = data["Close"].pct_change(5)
     return data
+
+
+def sigmoid(value: pd.Series | float) -> pd.Series | float:
+    return 1 / (1 + np.exp(-np.clip(value, -50, 50)))
+
+
+def ensemble_probabilities(df: pd.DataFrame) -> pd.Series:
+    data = df.copy()
+    volume_ratio = (data["Volume"] / data["Volume_MA"]).replace([np.inf, -np.inf], np.nan).fillna(1)
+    trend_model = sigmoid(
+        8 * data["Momentum_5"].fillna(0)
+        + 2.5 * ((data["Close"] / data["SMA_20"]) - 1).replace([np.inf, -np.inf], 0).fillna(0)
+        + 1.5 * ((data["Close"] / data["VWAP"]) - 1).replace([np.inf, -np.inf], 0).fillna(0)
+    )
+    rsi_model = np.where(
+        data["RSI"].between(45, 68),
+        0.62,
+        np.where(data["RSI"] < 35, 0.56, np.where(data["RSI"] > 74, 0.34, 0.48)),
+    )
+    flow_model = sigmoid(
+        1.2 * (volume_ratio - 1)
+        + 1.8 * ((data["Close"] / data["VWAP"]) - 1).replace([np.inf, -np.inf], 0).fillna(0)
+    )
+    probability = 0.45 * trend_model + 0.30 * pd.Series(rsi_model, index=data.index) + 0.25 * flow_model
+    return probability.clip(0.05, 0.95)
+
+
+def ensemble_accuracy(df: pd.DataFrame, threshold: float) -> tuple[float, int]:
+    data = df.copy().dropna(subset=["Close", "VWAP", "RSI", "Volume_MA", "SMA_20", "Momentum_5"])
+    if len(data) < 30:
+        return 0.0, 0
+    probability = ensemble_probabilities(data)
+    predicted_up = probability >= threshold
+    actual_up = data["Close"].shift(-1) > data["Close"]
+    comparable = actual_up.dropna().index.intersection(predicted_up.index)
+    if len(comparable) < 10:
+        return 0.0, 0
+    accuracy = (predicted_up.loc[comparable] == actual_up.loc[comparable]).mean() * 100
+    return float(accuracy), int(len(comparable))
+
+
+def bot_action(row: pd.Series, probability: float, threshold: float) -> str:
+    if probability >= threshold and row["Close"] >= row["VWAP"] and 42 <= row["RSI"] <= 72:
+        return "AUTO ENTRY"
+    if probability <= 0.42 or row["Close"] < row["VWAP"] or row["RSI"] >= 76:
+        return "AUTO EXIT"
+    return "HOLD"
 
 
 def predict_next_close(df: pd.DataFrame) -> tuple[float, float]:
@@ -112,13 +162,15 @@ def predict_next_close(df: pd.DataFrame) -> tuple[float, float]:
     y = clean["Close"].shift(-1).dropna()
     x = clean.loc[y.index, ["Close", "VWAP", "RSI", "Volume"]].copy()
     x["Volume"] = np.log1p(x["Volume"])
-    x = (x - x.mean()) / x.std(ddof=0).replace(0, 1)
-    design = np.column_stack([np.ones(len(x)), x.to_numpy()])
+    x_mean = x.mean()
+    x_std = x.std(ddof=0).replace(0, 1)
+    normalized_x = (x - x_mean) / x_std
+    design = np.column_stack([np.ones(len(normalized_x)), normalized_x.to_numpy()])
     coeffs = np.linalg.lstsq(design, y.to_numpy(), rcond=None)[0]
 
     latest_x = clean[["Close", "VWAP", "RSI", "Volume"]].tail(1).copy()
     latest_x["Volume"] = np.log1p(latest_x["Volume"])
-    latest_x = (latest_x - x.mean()) / x.std(ddof=0).replace(0, 1)
+    latest_x = (latest_x - x_mean) / x_std
     prediction = float(np.dot(np.r_[1, latest_x.iloc[0].to_numpy()], coeffs))
     latest_close = float(clean["Close"].iloc[-1])
     expected_move = (prediction / latest_close) - 1
@@ -154,6 +206,8 @@ def summarize_symbol(symbol: str, period: str, interval: str) -> dict:
     prediction, expected_move = predict_next_close(data)
     signal, reason = classify_signal(latest, expected_move)
     volume_ratio = float(latest["Volume"] / latest["Volume_MA"]) if latest["Volume_MA"] else 0
+    probability = float(ensemble_probabilities(data).iloc[-1])
+    accuracy, samples = ensemble_accuracy(data, 0.58)
 
     return {
         "Symbol": symbol,
@@ -161,14 +215,106 @@ def summarize_symbol(symbol: str, period: str, interval: str) -> dict:
         "Change %": (last_close / first_close - 1) * 100,
         "AI Next": prediction,
         "AI Move %": expected_move * 100,
+        "ML Prob %": probability * 100,
+        "ML Accuracy %": accuracy,
+        "ML Samples": samples,
         "VWAP": float(latest["VWAP"]),
         "RSI": float(latest["RSI"]),
         "Volume x": volume_ratio,
         "Smart Money": "Yes" if volume_ratio >= 1.8 and last_close >= latest["VWAP"] else "No",
+        "Bot Action": bot_action(latest, probability, 0.58),
         "Signal": signal,
         "Reason": reason,
         "Status": "OK",
     }
+
+
+def run_backtest(
+    data: pd.DataFrame,
+    threshold: float,
+    starting_cash: float,
+    position_pct: float,
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    fee_bps: float,
+) -> tuple[pd.DataFrame, dict]:
+    test = data.dropna(subset=["Close", "VWAP", "RSI", "Volume_MA", "SMA_20", "Momentum_5"]).copy()
+    if len(test) < 30:
+        return pd.DataFrame(), {"Trades": 0, "Return %": 0.0, "Win Rate %": 0.0, "Max Drawdown %": 0.0}
+
+    test["ML Prob"] = ensemble_probabilities(test)
+    cash = starting_cash
+    shares = 0.0
+    entry_price = 0.0
+    trade_returns = []
+    equity_rows = []
+    fee_rate = fee_bps / 10000
+
+    for timestamp, row in test.iterrows():
+        price = float(row["Close"])
+        equity = cash + shares * price
+        in_position = shares > 0
+        exit_signal = (
+            in_position
+            and (
+                price >= entry_price * (1 + take_profit_pct / 100)
+                or price <= entry_price * (1 - stop_loss_pct / 100)
+                or row["ML Prob"] <= 0.42
+                or price < row["VWAP"]
+                or row["RSI"] >= 76
+            )
+        )
+        entry_signal = (
+            not in_position
+            and row["ML Prob"] >= threshold
+            and price >= row["VWAP"]
+            and 42 <= row["RSI"] <= 72
+        )
+
+        action = "HOLD"
+        if exit_signal:
+            cash += shares * price * (1 - fee_rate)
+            trade_returns.append((price / entry_price - 1) * 100)
+            shares = 0.0
+            entry_price = 0.0
+            action = "EXIT"
+        elif entry_signal:
+            allocation = cash * position_pct / 100
+            shares = allocation * (1 - fee_rate) / price
+            cash -= allocation
+            entry_price = price
+            action = "ENTRY"
+
+        equity = cash + shares * price
+        equity_rows.append({"Time": timestamp, "Equity": equity, "Action": action, "Price": price, "ML Prob": row["ML Prob"]})
+
+    equity = pd.DataFrame(equity_rows).set_index("Time")
+    peak = equity["Equity"].cummax()
+    drawdown = ((equity["Equity"] / peak) - 1) * 100
+    stats = {
+        "Trades": len(trade_returns),
+        "Return %": (equity["Equity"].iloc[-1] / starting_cash - 1) * 100,
+        "Win Rate %": (np.mean([item > 0 for item in trade_returns]) * 100) if trade_returns else 0.0,
+        "Max Drawdown %": float(drawdown.min()) if not drawdown.empty else 0.0,
+    }
+    return equity, stats
+
+
+def rebalance_plan(summary: pd.DataFrame, portfolio_value: float, max_weight_pct: float) -> pd.DataFrame:
+    data = summary.copy()
+    signal_score = data["Signal"].map({"BUY": 1.0, "SMART MONEY": 0.9, "WATCH": 0.35, "SELL": 0.0}).fillna(0.2)
+    ml_score = (data["ML Prob %"] / 100).clip(0, 1)
+    move_score = sigmoid(data["AI Move %"] / 3)
+    raw_score = (0.45 * ml_score + 0.35 * signal_score + 0.20 * move_score).clip(lower=0)
+    if raw_score.sum() <= 0:
+        data["Target Weight %"] = 0.0
+    else:
+        data["Target Weight %"] = raw_score / raw_score.sum() * 100
+        data["Target Weight %"] = data["Target Weight %"].clip(upper=max_weight_pct)
+        data["Target Weight %"] = data["Target Weight %"] / data["Target Weight %"].sum() * 100
+    data["Target Value"] = portfolio_value * data["Target Weight %"] / 100
+    data["Approx Shares"] = np.floor(data["Target Value"] / data["Price"]).astype(int)
+    return data[["Symbol", "Signal", "ML Prob %", "Target Weight %", "Target Value", "Approx Shares"]]
 
 
 def alert_message(rows: pd.DataFrame) -> str:
@@ -319,6 +465,15 @@ with st.sidebar:
     period = st.selectbox("History", PERIOD_OPTIONS, index=2)
     interval = st.selectbox("Interval", INTERVAL_OPTIONS, index=3)
     selected_symbol = st.text_input("Chart symbol", value=DEFAULT_SYMBOLS[0])
+    st.header("Bot controls")
+    bot_threshold = st.slider("Entry confidence", min_value=0.50, max_value=0.90, value=0.58, step=0.01)
+    starting_cash = st.number_input("Backtest cash", min_value=1000, max_value=1000000, value=10000, step=1000)
+    position_pct = st.slider("Position size %", min_value=5, max_value=100, value=30, step=5)
+    take_profit_pct = st.slider("Take profit %", min_value=1.0, max_value=30.0, value=8.0, step=0.5)
+    stop_loss_pct = st.slider("Stop loss %", min_value=1.0, max_value=20.0, value=4.0, step=0.5)
+    fee_bps = st.slider("Fee bps", min_value=0.0, max_value=50.0, value=5.0, step=1.0)
+    portfolio_value = st.number_input("Portfolio value", min_value=1000, max_value=5000000, value=25000, step=1000)
+    max_weight_pct = st.slider("Max stock weight %", min_value=5, max_value=60, value=25, step=5)
     send_alerts = st.toggle("Send alerts now", value=False)
     st.caption("Alert credentials are read from environment variables.")
 
@@ -344,20 +499,62 @@ metric_cols = st.columns(4)
 metric_cols[0].metric("Tracked", len(summary))
 metric_cols[1].metric("Best AI Move", leader["Symbol"], f"{leader['AI Move %']:.2f}%")
 metric_cols[2].metric("Smart Money", int((summary["Smart Money"] == "Yes").sum()))
-metric_cols[3].metric("Buy Signals", int((summary["Signal"] == "BUY").sum()))
+metric_cols[3].metric("Auto Entries", int((summary["Bot Action"] == "AUTO ENTRY").sum()))
 
-st.subheader("Bloomberg-Style Heatmap")
-st.plotly_chart(make_heatmap(summary), width="stretch")
+tab_market, tab_bot, tab_backtest, tab_portfolio = st.tabs(["Market", "Auto Bot", "Backtest", "Portfolio AI"])
 
-st.subheader("Signal Board")
-display = summary.copy()
-display["Signal"] = display["Signal"].map(signal_badge)
-st.write(
-    display[
-        ["Symbol", "Price", "Change %", "AI Next", "AI Move %", "VWAP", "RSI", "Volume x", "Smart Money", "Signal", "Reason"]
-    ].to_html(escape=False, index=False, float_format=lambda value: f"{value:,.2f}"),
-    unsafe_allow_html=True,
-)
+with tab_market:
+    st.subheader("Bloomberg-Style Heatmap")
+    st.plotly_chart(make_heatmap(summary), width="stretch")
+
+    st.subheader("Signal Board")
+    display = summary.copy()
+    display["Signal"] = display["Signal"].map(signal_badge)
+    st.write(
+        display[
+            [
+                "Symbol",
+                "Price",
+                "Change %",
+                "AI Next",
+                "AI Move %",
+                "ML Prob %",
+                "ML Accuracy %",
+                "VWAP",
+                "RSI",
+                "Volume x",
+                "Smart Money",
+                "Signal",
+                "Reason",
+            ]
+        ].to_html(escape=False, index=False, float_format=lambda value: f"{value:,.2f}"),
+        unsafe_allow_html=True,
+    )
+
+with tab_bot:
+    st.subheader("Automated Trading Bot")
+    st.caption("Paper-trading automation and broker-ready action instructions. Live order execution needs broker API keys and explicit order permission.")
+    bot_board = summary[
+        [
+            "Symbol",
+            "Price",
+            "Bot Action",
+            "Signal",
+            "ML Prob %",
+            "ML Accuracy %",
+            "AI Move %",
+            "RSI",
+            "VWAP",
+            "Volume x",
+        ]
+    ].copy()
+    st.dataframe(bot_board, width="stretch", hide_index=True)
+    actionable_bot = bot_board[bot_board["Bot Action"].isin(["AUTO ENTRY", "AUTO EXIT"])]
+    if actionable_bot.empty:
+        st.info("No auto entry or exit actions at the current confidence threshold.")
+    else:
+        st.success("Bot actions are ready for paper execution.")
+        st.dataframe(actionable_bot, width="stretch", hide_index=True)
 
 chart_symbol = selected_symbol.strip().upper() or summary.iloc[0]["Symbol"]
 history = fetch_history(chart_symbol, period, interval)
@@ -365,18 +562,61 @@ if history.empty:
     st.warning(f"No chart data found for {chart_symbol}.")
 else:
     chart_data = add_indicators(history).dropna()
-    left, right = st.columns([2, 1])
-    with left:
-        st.plotly_chart(make_price_chart(chart_symbol, chart_data), width="stretch")
-    with right:
-        st.plotly_chart(make_rsi_chart(chart_data), width="stretch")
-        latest_row = summary[summary["Symbol"].eq(chart_symbol)]
-        if not latest_row.empty:
-            item = latest_row.iloc[0]
-            st.markdown(f"### {item['Symbol']} {signal_badge(item['Signal'])}", unsafe_allow_html=True)
-            st.write(item["Reason"])
-            st.metric("AI next close", f"{item['AI Next']:.2f}", f"{item['AI Move %']:.2f}%")
-            st.metric("Volume expansion", f"{item['Volume x']:.2f}x")
+    with tab_market:
+        left, right = st.columns([2, 1])
+        with left:
+            st.plotly_chart(make_price_chart(chart_symbol, chart_data), width="stretch")
+        with right:
+            st.plotly_chart(make_rsi_chart(chart_data), width="stretch")
+            latest_row = summary[summary["Symbol"].eq(chart_symbol)]
+            if not latest_row.empty:
+                item = latest_row.iloc[0]
+                st.markdown(f"### {item['Symbol']} {signal_badge(item['Signal'])}", unsafe_allow_html=True)
+                st.write(item["Reason"])
+                st.metric("AI next close", f"{item['AI Next']:.2f}", f"{item['AI Move %']:.2f}%")
+                st.metric("Ensemble probability", f"{item['ML Prob %']:.1f}%")
+                st.metric("Measured accuracy", f"{item['ML Accuracy %']:.1f}%", f"{int(item['ML Samples'])} samples")
+
+    with tab_backtest:
+        st.subheader(f"{chart_symbol} Backtesting System")
+        equity, stats = run_backtest(
+            chart_data,
+            bot_threshold,
+            float(starting_cash),
+            float(position_pct),
+            float(take_profit_pct),
+            float(stop_loss_pct),
+            float(fee_bps),
+        )
+        stat_cols = st.columns(4)
+        stat_cols[0].metric("Return", f"{stats['Return %']:.2f}%")
+        stat_cols[1].metric("Trades", stats["Trades"])
+        stat_cols[2].metric("Win Rate", f"{stats['Win Rate %']:.1f}%")
+        stat_cols[3].metric("Max Drawdown", f"{stats['Max Drawdown %']:.2f}%")
+        if equity.empty:
+            st.warning("Not enough clean historical data to backtest this symbol and interval.")
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=equity.index, y=equity["Equity"], mode="lines", name="Equity", line=dict(color="#2563eb")))
+            entries = equity[equity["Action"].eq("ENTRY")]
+            exits = equity[equity["Action"].eq("EXIT")]
+            fig.add_trace(go.Scatter(x=entries.index, y=entries["Equity"], mode="markers", name="Entry", marker=dict(color="#16a34a", size=9)))
+            fig.add_trace(go.Scatter(x=exits.index, y=exits["Equity"], mode="markers", name="Exit", marker=dict(color="#b91c1c", size=9)))
+            fig.update_layout(
+                height=360,
+                margin=dict(l=10, r=10, t=25, b=10),
+                template="plotly_white",
+                paper_bgcolor="#f6f7fb",
+                plot_bgcolor="#ffffff",
+                font=dict(color="#334155"),
+            )
+            st.plotly_chart(fig, width="stretch")
+
+with tab_portfolio:
+    st.subheader("Portfolio Rebalancing AI")
+    st.caption("Long-only target allocation using signal quality, ensemble probability, and AI move estimate.")
+    plan = rebalance_plan(summary, float(portfolio_value), float(max_weight_pct))
+    st.dataframe(plan, width="stretch", hide_index=True)
 
 message = alert_message(summary)
 if send_alerts:
